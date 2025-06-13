@@ -1,13 +1,16 @@
 import os
 import traceback
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 
+# add this:
+from langdetect import detect, LangDetectException
+
 # ----------------------------------------------------------------------------
 # 1. DEVICE and MODEL PATHS
 # ----------------------------------------------------------------------------
-
 os.environ['CUDA_VISIBLE_DEVICES'] = '3'
 LORA_ADAPTER_PATH = os.getenv(
     "LORA_PATH",
@@ -23,33 +26,25 @@ try:
     # base_model.to("cuda")
     base_model.eval()
 except Exception as e:
-    raise RuntimeError(
-        f"Error loading model/tokenizer from '{LORA_ADAPTER_PATH}': {e}"
-    )
+    raise RuntimeError(f"Error loading model/tokenizer: {e}")
 
 # ----------------------------------------------------------------------------
 # 3. FASTAPI SETUP
 # ----------------------------------------------------------------------------
 app = FastAPI(
-    title="Generic T5 Translation",
-    description="Translate text from any source language to any target language.",
+    title="Spanish→English Translation",
+    description="Only translates Spanish to English. Rejects non-Spanish inputs.",
     version="1.0.0",
 )
 
-
 class TranslateRequest(BaseModel):
     input: str
-    source: str  # e.g. "es"
-    target: str  # e.g. "en"
-
+    source: str  # must be "es"
+    target: str  # must be "en"
 
 class TranslateResponse(BaseModel):
     output: str
 
-
-# ----------------------------------------------------------------------------
-# 4. HEALTH-CHECK ENDPOINT
-# ----------------------------------------------------------------------------
 @app.get("/")
 async def health_check():
     ok = tokenizer is not None and base_model is not None
@@ -58,24 +53,36 @@ async def health_check():
         "lora_adapter": LORA_ADAPTER_PATH
     }
 
-
 # ----------------------------------------------------------------------------
-# 5. TRANSLATION ENDPOINT
+# 4. TRANSLATION ENDPOINT WITH VALIDATION
 # ----------------------------------------------------------------------------
 @app.post("/translate/", response_model=TranslateResponse)
 async def translate(req: TranslateRequest):
     text = req.input.strip()
     if not text:
-        raise HTTPException(400, "Input text must be non-empty")
+        raise HTTPException(400, detail="Input text must be non-empty")
 
-    src = req.source.lower()
-    tgt = req.target.lower()
-    # must match your fine-tuning prefix
-    prefix = f"translate {src} to {tgt}: "
+    # enforce Spanish→English only
+    if req.source.lower() != "es" or req.target.lower() != "en":
+        raise HTTPException(
+            400,
+            detail="Only Spanish-to-English supported: source must be 'es' and target must be 'en'"
+        )
+
+    # detect language
+    try:
+        lang = detect(text)
+    except LangDetectException:
+        raise HTTPException(400, detail="Could not detect input language")
+
+    if lang != "es":
+        raise HTTPException(400, detail="Input text should be Spanish text")
+
+    # build your fine-tuning prefix
+    prefix = "translate es to en: "
     prompt = prefix + text
 
     try:
-        # (if you uncomment .to("cuda") above, use tokenizer(...).to("cuda") here)
         inputs = tokenizer(prompt, return_tensors="pt").input_ids.to(base_model.device)
         outputs = base_model.generate(input_ids=inputs)
         translated = tokenizer.decode(outputs[0], skip_special_tokens=True)
@@ -83,11 +90,10 @@ async def translate(req: TranslateRequest):
     except Exception as e:
         tb = traceback.format_exc()
         # (optionally log tb)
-        raise HTTPException(500, f"Translation failed: {e}")
-
+        raise HTTPException(500, detail=f"Translation failed: {e}")
 
 # ----------------------------------------------------------------------------
-# 6. RUN WITH UVICORN
+# 5. RUN WITH UVICORN
 # ----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
