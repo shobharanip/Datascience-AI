@@ -5,101 +5,95 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import T5ForConditionalGeneration, T5Tokenizer
 
-# add this:
-from langdetect import detect, LangDetectException
-
-# ----------------------------------------------------------------------------
-# 1. DEVICE and MODEL PATHS
-# ----------------------------------------------------------------------------
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+# ——————————————————————————————————————————————————————————————
+# 1. Device & model path
+# ——————————————————————————————————————————————————————————————
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 LORA_ADAPTER_PATH = os.getenv(
     "LORA_PATH",
     "/app/cortex/dev1/aptaiModels/madlad_merged_LORA_8_v6"
 )
 
-# ----------------------------------------------------------------------------
-# 2. LOAD TOKENIZER & MODEL
-# ----------------------------------------------------------------------------
-try:
-    tokenizer = T5Tokenizer.from_pretrained(LORA_ADAPTER_PATH)
-    base_model = T5ForConditionalGeneration.from_pretrained(LORA_ADAPTER_PATH)
-    # base_model.to("cuda")
-    base_model.eval()
-except Exception as e:
-    raise RuntimeError(f"Error loading model/tokenizer: {e}")
+# ——————————————————————————————————————————————————————————————
+# 2. Load tokenizer + model
+# ——————————————————————————————————————————————————————————————
+tokenizer = T5Tokenizer.from_pretrained(LORA_ADAPTER_PATH)
+model     = T5ForConditionalGeneration.from_pretrained(LORA_ADAPTER_PATH)
+model.eval()
 
-# ----------------------------------------------------------------------------
-# 3. FASTAPI SETUP
-# ----------------------------------------------------------------------------
+# Make sure the tokenizer knows about the special token `<2en>`
+# (Usually T5 has language‐tags built in; if yours doesn’t you can add it)
+if "<2en>" not in tokenizer.get_vocab():
+    tokenizer.add_special_tokens({"additional_special_tokens": ["<2en>"]})
+    model.resize_token_embeddings(len(tokenizer))
+
+# Grab the integer ID for `<2en>` once
+prefix_id = tokenizer.convert_tokens_to_ids("<2en>")
+
+# ——————————————————————————————————————————————————————————————
+# 3. FastAPI setup
+# ——————————————————————————————————————————————————————————————
 app = FastAPI(
     title="Spanish→English Translation",
-    description="Only translates Spanish to English. Rejects non-Spanish inputs.",
+    description="Only translates Spanish to English (enforced).",
     version="1.0.0",
 )
 
 class TranslateRequest(BaseModel):
     input: str
-    source: str  # must be "es"
-    target: str  # must be "en"
+    source: str   # must be "es"
+    target: str   # must be "en"
 
 class TranslateResponse(BaseModel):
     output: str
 
 @app.get("/")
 async def health_check():
-    ok = tokenizer is not None and base_model is not None
+    ok = tokenizer is not None and model is not None
     return {
         "status": "healthy" if ok else "failed",
         "lora_adapter": LORA_ADAPTER_PATH
     }
 
-# ----------------------------------------------------------------------------
-# 4. TRANSLATION ENDPOINT WITH VALIDATION
-# ----------------------------------------------------------------------------
 @app.post("/translate/", response_model=TranslateResponse)
 async def translate(req: TranslateRequest):
     text = req.input.strip()
     if not text:
-        raise HTTPException(400, detail="Input text must be non-empty")
+        raise HTTPException(400, "Input text must be non-empty")
 
-    # enforce Spanish→English only
+    # enforce Spanish → English only
     if req.source.lower() != "es" or req.target.lower() != "en":
         raise HTTPException(
             400,
-            detail="Only Spanish-to-English supported: source must be 'es' and target must be 'en'"
+            "Only Spanish-to-English supported: source='es', target='en'"
         )
 
-    # detect language
-    try:
-        lang = detect(text)
-    except LangDetectException:
-        raise HTTPException(400, detail="Could not detect input language")
+    # (optional) quick language check
+    # from langdetect import detect
+    # if detect(text) != "es":
+    #     raise HTTPException(400, "Input text should be Spanish")
 
-    if lang != "es":
-        raise HTTPException(400, detail="Input text should be Spanish text")
-
-    # build your fine-tuning prefix
-    prefix = "translate es to en: "
-    prompt = prefix + text
+    # tokenize the raw Spanish text **without** adding any extra T5 prefix tokens
+    enc = tokenizer(text, return_tensors="pt", add_special_tokens=False).input_ids.to(model.device)
 
     try:
-        inputs = tokenizer(prompt, return_tensors="pt").input_ids.to(base_model.device)
-        outputs = base_model.generate(input_ids=inputs)
-        translated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        # generate, **forcing** the decoder to start with <2en>
+        out = model.generate(
+            enc,
+            decoder_start_token_id=prefix_id,
+            max_length=512,
+            num_beams=4,
+            early_stopping=True,
+        )
+        # decode skipping ALL special tokens
+        translated = tokenizer.decode(out[0], skip_special_tokens=True)
         return TranslateResponse(output=translated)
+
     except Exception as e:
         tb = traceback.format_exc()
-        # (optionally log tb)
-        raise HTTPException(500, detail=f"Translation failed: {e}")
+        # (optionally log tb somewhere)
+        raise HTTPException(500, f"Translation failed: {e}")
 
-# ----------------------------------------------------------------------------
-# 5. RUN WITH UVICORN
-# ----------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "translation_app:app",
-        host="0.0.0.0",
-        port=8100,
-        reload=True
-    )
+    uvicorn.run("translation_app:app", host="0.0.0.0", port=8100, reload=True)
